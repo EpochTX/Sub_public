@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -54,7 +55,8 @@ def download_content(alias, data, config):
     text = data.decode("utf-8-sig")
     text = "\n".join(line for line in text.split("\n")
                      if not line.startswith("#!MANAGED-CONFIG "))
-    url = "https://" + config["domain"] + "/s/" + config["download_token"] + "/surge.conf"
+    base = config.get("public_base_url", "https://" + config["domain"])
+    url = base + "/s/" + config["download_token"] + "/surge.conf"
     return ("#!MANAGED-CONFIG " + url + " interval=3600 strict=false\n" + text).encode()
 
 
@@ -71,17 +73,18 @@ class Sync:
         env = os.environ.copy()
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_CONFIG_NOSYSTEM"] = "1"
-        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
         if self.config.get("ssh_key"):
             import shlex
             env["GIT_SSH_COMMAND"] = " ".join([
-                "ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes",
+                shlex.quote(self.config.get("ssh_executable", "ssh").replace("\\", "/")),
+                "-F none -o BatchMode=yes -o IdentitiesOnly=yes",
                 "-o StrictHostKeyChecking=yes -o ConnectTimeout=15",
-                "-i", shlex.quote(self.config["ssh_key"]),
-                "-o", shlex.quote("UserKnownHostsFile=" + self.config["known_hosts"]),
+                "-i", shlex.quote(self.config["ssh_key"].replace("\\", "/")),
+                "-o", shlex.quote("UserKnownHostsFile=" + self.config["known_hosts"].replace("\\", "/")),
             ])
         result = subprocess.run(
-            ["git", "--git-dir", str(self.repo), *args], env=env,
+            [self.config.get("git_executable", "git"), "--git-dir", str(self.repo), *args], env=env,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120,
             check=True,
         )
@@ -90,20 +93,32 @@ class Sync:
     def source_url(self):
         return self.config.get("source_url", "git@github.com:" + self.config["repo"] + ".git")
 
+    def current_release(self):
+        pointer = self.state / "current.sha"
+        if pointer.exists():
+            revision = pointer.read_text().strip()
+            if not re.fullmatch(r"[0-9a-f]{40,64}", revision):
+                raise OSError("invalid release pointer")
+            return self.state / "releases" / revision
+        # Read already-installed Linux releases during a version transition.
+        return (self.state / "current").resolve(strict=True)
+
     def once(self):
         with self.lock:
             self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
             if not self.repo.exists():
-                subprocess.run(["git", "init", "--bare", str(self.repo)],
+                subprocess.run([self.config.get("git_executable", "git"), "init", "--bare", str(self.repo)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                check=True, timeout=30)
             branch = self.config["branch"]
             self.git("fetch", "--depth=1", "--no-tags", self.source_url(),
                      "+refs/heads/" + branch + ":refs/heads/current")
             revision = self.git("rev-parse", "refs/heads/current").decode().strip()
-            current = self.state / "current"
-            if current.is_symlink() and current.resolve().name == revision:
-                return False
+            try:
+                if self.current_release().name == revision:
+                    return False
+            except OSError:
+                pass
             releases = self.state / "releases"
             releases.mkdir(mode=0o700, exist_ok=True)
             stage = Path(tempfile.mkdtemp(prefix=".stage-", dir=releases))
@@ -121,8 +136,8 @@ class Sync:
                     shutil.rmtree(stage)
                 pointer = self.state / ".next"
                 pointer.unlink(missing_ok=True)
-                pointer.symlink_to(release)
-                os.replace(pointer, current)
+                pointer.write_text(revision + "\n", encoding="ascii")
+                os.replace(pointer, self.state / "current.sha")
                 LOG.info("Published configuration revision %s", revision[:12])
                 old = sorted((p for p in releases.iterdir()
                               if p.is_dir() and re.fullmatch(r"[0-9a-f]{40,64}", p.name)
@@ -189,7 +204,7 @@ def make_server(config, sync):
                 self.reply(404)
                 return
             try:
-                release = (sync.state / "current").resolve(strict=True)
+                release = sync.current_release()
                 data = (release / parts[3]).read_bytes()
             except OSError:
                 self.reply(503, b"Configuration not ready\n")
@@ -244,7 +259,38 @@ def make_server(config, sync):
         daemon_threads = True
         request_queue_size = 16
 
-    return Server((config.get("bind", "127.0.0.1"), config.get("port", 8767)), Handler)
+        def get_request(self):
+            connection, address = super().get_request()
+            if not config.get("tls_cert"):
+                return connection, address
+            try:
+                self.refresh_tls()
+                connection.settimeout(15)
+                return self.tls_context.wrap_socket(connection, server_side=True,
+                                                    do_handshake_on_connect=False), address
+            except Exception:
+                connection.close()
+                raise
+
+        def refresh_tls(self):
+            paths = (config["tls_cert"], config["tls_key"])
+            stamp = tuple(Path(path).stat().st_mtime_ns for path in paths)
+            if getattr(self, "tls_stamp", None) == stamp:
+                return
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context.load_cert_chain(*paths)
+            self.tls_context = context
+            self.tls_stamp = stamp
+
+    server = Server((config.get("bind", "127.0.0.1"), config.get("port", 8767)), Handler)
+    try:
+        if config.get("tls_cert"):
+            server.refresh_tls()
+    except Exception:
+        server.server_close()
+        raise
+    return server
 
 
 def load_config(path):
@@ -256,10 +302,17 @@ def load_config(path):
     for key in ("download_token", "webhook_secret"):
         if not re.fullmatch(r"[0-9a-f]{64}", config[key]):
             raise ValueError("invalid secret")
-    if config.get("bind", "127.0.0.1") != "127.0.0.1":
-        raise ValueError("use an HTTPS reverse proxy; bind must be loopback")
+    if bool(config.get("tls_cert")) != bool(config.get("tls_key")):
+        raise ValueError("both TLS certificate and key are required")
+    if config.get("bind", "127.0.0.1") != "127.0.0.1" and not config.get("tls_cert"):
+        raise ValueError("public binding requires HTTPS")
     if not re.fullmatch(r"[A-Za-z0-9.-]+", config["domain"]):
         raise ValueError("invalid domain")
+    if config.get("public_base_url"):
+        base = urlsplit(config["public_base_url"])
+        if (base.scheme != "https" or base.hostname != config["domain"].lower()
+                or base.username or base.password or base.path or base.query or base.fragment):
+            raise ValueError("invalid public HTTPS URL")
     return config
 
 

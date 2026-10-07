@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import http.client
 import json
+import ssl
 from pathlib import Path
 import subprocess
 import tempfile
@@ -10,7 +11,7 @@ import unittest
 from unittest.mock import Mock
 from urllib.parse import quote
 
-from server import FILES, Sync, download_content, make_server, validate_config
+from server import FILES, Sync, download_content, load_config, make_server, validate_config
 
 YAML = b"dns: {nameserver: [1.1.1.1]}\nproxies: [{name: test}]\nproxy-groups: [{name: test}]\nrules: [MATCH,test]\n"
 PROFILE = b"[General]\n[Proxy Group]\n[Rule]\nFINAL,DIRECT\n"
@@ -25,10 +26,10 @@ class HTTPTests(unittest.TestCase):
                        "webhook_secret": "b" * 64}
         self.sync = Sync(self.config)
         self.sync.request = Mock()
-        release = Path(self.temp.name) / "release"
-        release.mkdir()
+        release = Path(self.temp.name) / "releases" / ("c" * 40)
+        release.mkdir(parents=True)
         (release / "surge.conf").write_bytes(PROFILE)
-        (Path(self.temp.name) / "current").symlink_to(release)
+        (Path(self.temp.name) / "current.sha").write_text("c" * 40)
         self.server = make_server(self.config, self.sync)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -121,7 +122,7 @@ class SyncTests(unittest.TestCase):
             sync = Sync({"repo": "EpochTX/sub", "branch": "main",
                          "state_dir": str(root / "state"), "source_url": str(source)})
             self.assertTrue(sync.once())
-            previous = (sync.state / "current").resolve()
+            previous = sync.current_release()
             self.assertEqual({p.name for p in previous.iterdir()}, set(FILES))
             self.assertFalse(sync.once())
             (source / FILES["clash.yaml"]).write_text("dns: [invalid YAML")
@@ -129,20 +130,67 @@ class SyncTests(unittest.TestCase):
             git("commit", "-m", "invalid")
             with self.assertRaises(Exception):
                 sync.once()
-            self.assertEqual((sync.state / "current").resolve(), previous)
+            self.assertEqual(sync.current_release(), previous)
             self.assertEqual((previous / "surge.conf").read_bytes(), PROFILE)
             self.assertFalse(list((sync.state / "releases").glob(".stage-*")))
             (source / FILES["clash.yaml"]).write_bytes(YAML + b"# fixed\n")
             git("add", ".")
             git("commit", "-m", "fixed")
             self.assertTrue(sync.once())
-            self.assertNotEqual((sync.state / "current").resolve(), previous)
+            self.assertNotEqual(sync.current_release(), previous)
 
     def test_empty_truncated_and_incomplete_files_fail_validation(self):
         for alias, data in (("clash.yaml", b""), ("clash.yaml", b"dns: {}\n"),
                             ("surge.conf", b"[General]\n"), ("surge.conf", b"\xff")):
             with self.subTest(alias=alias, data=data), self.assertRaises(Exception):
                 validate_config(alias, data)
+
+    def test_public_binding_requires_tls_and_url_keeps_port(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = {"repo": "EpochTX/sub", "branch": "main", "domain": "sub.example.invalid",
+                      "bind": "0.0.0.0", "state_dir": temp,
+                      "download_token": "a" * 64, "webhook_secret": "b" * 64}
+            path = Path(temp) / "config.json"
+            path.write_text(json.dumps(config))
+            with self.assertRaises(ValueError):
+                load_config(path)
+            config.update(tls_cert="cert.pem", tls_key="key.pem",
+                          public_base_url="https://sub.example.invalid:8443")
+            path.write_text(json.dumps(config))
+            self.assertEqual(load_config(path)["bind"], "0.0.0.0")
+            self.assertIn(b"https://sub.example.invalid:8443/s/", download_content("surge.conf", PROFILE, config))
+
+    @unittest.skipUnless(__import__("shutil").which("openssl"), "openssl is needed for TLS integration")
+    def test_https_certificate_verification_and_private_download(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cert, key = root / "cert.pem", root / "key.pem"
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                            "-keyout", str(key), "-out", str(cert), "-days", "1",
+                            "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            config = {"repo": "EpochTX/sub", "branch": "main", "domain": "localhost",
+                      "state_dir": temp, "port": 0, "download_token": "a" * 64,
+                      "webhook_secret": "b" * 64, "tls_cert": str(cert), "tls_key": str(key)}
+            sync = Sync(config)
+            release = root / "releases" / ("d" * 40)
+            release.mkdir(parents=True)
+            (release / "clash.yaml").write_bytes(YAML)
+            (root / "current.sha").write_text("d" * 40)
+            server = make_server(config, sync)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                context = ssl.create_default_context(cafile=str(cert))
+                connection = http.client.HTTPSConnection("localhost", server.server_port, context=context)
+                connection.request("GET", "/s/" + config["download_token"] + "/clash.yaml")
+                response = connection.getresponse()
+                self.assertEqual((response.status, response.read()), (200, YAML))
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
 
 
 if __name__ == "__main__":
