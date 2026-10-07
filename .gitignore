@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+config.json
+deploy_key*
+*.env
+repo.git/
+releases/
+.private-test/
