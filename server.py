@@ -37,11 +37,23 @@ def validate_config(name, data):
         parsed = yaml.safe_load(text)
         if not isinstance(parsed, dict):
             raise ValueError("expected YAML mapping")
-        for key, kind in (("dns", dict), ("proxy-groups", list), ("rules", list)):
-            if not isinstance(parsed.get(key), kind) or not parsed[key]:
-                raise ValueError("missing required YAML section")
-        if not (parsed.get("proxies") or parsed.get("proxy-providers")):
-            raise ValueError("missing proxy definitions")
+        # The legacy openclash.yaml URL now serves a NetProxy node-only subscription.
+        # Continue accepting the historical full Mihomo document for safe rollbacks.
+        # Other YAML aliases still require complete client profiles.
+        if name == "openclash.yaml" and set(parsed) == {"proxies"}:
+            nodes = parsed["proxies"]
+            if (not isinstance(nodes, list) or not nodes
+                    or any(not isinstance(node, dict)
+                           or not isinstance(node.get("name"), str) or not node["name"]
+                           or not isinstance(node.get("type"), str) or not node["type"]
+                           for node in nodes)):
+                raise ValueError("invalid NetProxy node-only subscription")
+        else:
+            for key, kind in (("dns", dict), ("proxy-groups", list), ("rules", list)):
+                if not isinstance(parsed.get(key), kind) or not parsed[key]:
+                    raise ValueError("missing required YAML section")
+            if not (parsed.get("proxies") or parsed.get("proxy-providers")):
+                raise ValueError("missing proxy definitions")
     else:
         for section in ("[General]", "[Proxy Group]", "[Rule]"):
             if not re.search(r"(?m)^" + re.escape(section) + r"\s*$", text):
