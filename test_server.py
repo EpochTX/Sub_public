@@ -16,6 +16,8 @@ from server import FILES, Sync, download_content, load_config, make_server, vali
 YAML = b"dns: {nameserver: [1.1.1.1]}\nproxies: [{name: test}]\nproxy-groups: [{name: test}]\nrules: [MATCH,test]\n"
 PROFILE = b"[General]\n[Proxy Group]\n[Rule]\nFINAL,DIRECT\n"
 
+NETPROXY_NODES = b"proxies:\\n  - name: HK-VPS\\n    type: ss\\n    server: 127.0.0.1\\n    port: 8388\\n"
+
 
 class HTTPTests(unittest.TestCase):
     def setUp(self):
@@ -115,7 +117,7 @@ class SyncTests(unittest.TestCase):
             git("config", "user.name", "Test")
             git("config", "user.email", "test@example.invalid")
             for alias, path in FILES.items():
-                (source / path).write_bytes(YAML if alias.endswith(".yaml") else PROFILE)
+                (source / path).write_bytes(NETPROXY_NODES if alias == "openclash.yaml" else (YAML if alias.endswith(".yaml") else PROFILE))
             (source / "private.env").write_text("SHOULD_NOT_BE_SERVED")
             git("add", ".")
             git("commit", "-m", "valid")
@@ -144,6 +146,22 @@ class SyncTests(unittest.TestCase):
                             ("surge.conf", b"[General]\n"), ("surge.conf", b"\xff")):
             with self.subTest(alias=alias, data=data), self.assertRaises(Exception):
                 validate_config(alias, data)
+
+    def test_netproxy_nodes_at_original_openclash_alias(self):
+        validate_config("openclash.yaml", NETPROXY_NODES)
+        validate_config("openclash.yaml", YAML)  # Allow historical full-profile rollback.
+        for alias in ("clash.yaml", "maomao.yaml"):
+            with self.subTest(alias=alias), self.assertRaises(ValueError):
+                validate_config(alias, NETPROXY_NODES)
+        invalid_nodes = (
+            b"proxies: []\\n",
+            b"proxies: [{name: missing_type}]\\n",
+            b"proxies: [{type: ss}]\\n",
+            b"proxies: [{name: n, type: ss}]\\nproxy-groups: []\\n",
+        )
+        for value in invalid_nodes:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_config("openclash.yaml", value)
 
     def test_public_binding_requires_tls_and_url_keeps_port(self):
         with tempfile.TemporaryDirectory() as temp:
